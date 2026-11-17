@@ -1,0 +1,270 @@
+################################################################################
+### QC_Audit.R
+###
+### Was QC done correctly on the single-nucleus dataset? An audit of the FINAL object (the one the
+### analyses use), each check ending in PASS / CHECK / FLAG with the numbers behind it.
+### Works on any of your Seurat v5 objects (BPCells counts are fine; only small gene subsets are read).
+### Run once for the NE object and once for the DREADD object.
+###
+###   1  Thresholds    were the intended cell filters actually applied? (no retained cell outside them)
+###   2  Per sample    nuclei, median UMIs / genes / % mito per mouse; outlier mice (> 3 MAD within sex x run)
+###   3  Sex check     Xist vs chrY genes per mouse vs the metadata sex (catches sample swaps / mislabels)
+###   4  Mito / ribo   % mito and % ribo per cell type (nuclei should be low; high = cytoplasmic carry-over)
+###   5  Doublets      cells co-expressing markers of two lineages, per cell type; doublet-score column if present
+###   6  Ambient RNA   other-lineage marker UMIs per 1,000 UMIs in each cell type, per mouse (neuronal RNA in glia)
+###   7  Clusters      low-quality clusters (low genes, high mito) and clusters made mostly of one mouse
+###   8  Composition   cell-type proportions per mouse; outlier mice within their sex x age x condition group
+###   9  Runs          QC metrics by sequencing run within sex x age x condition (e.g. the separate middle-age HC run)
+###
+### Outputs: <OUT>/QC_Audit_Summary.csv (one line per check), QC_Audit.xlsx (all tables), QC_Audit_Plots.pdf
+################################################################################
+
+suppressPackageStartupMessages({ library(Seurat); library(dplyr); library(tidyr); library(ggplot2); library(Matrix) })
+
+################################################################################
+### PARAMETERS (set these to your object)
+################################################################################
+
+OBJ_NAME   <- "df_harmony"        # object already loaded in the session ...
+SEURAT_RDS <- NULL                # ... or a path to readRDS
+OUT <- file.path("/storage1/fs1/pollina/Active/Lab_Members/Joowon/RNA_seq/",
+                 "SR008865_SR009556_SR011142_10X_Final_Analysis/LogNorm/QC_Audit", format(Sys.Date(), "%Y-%m-%d"))
+ASSAY        <- "RNA"
+SAMPLE_COL   <- "orig.ident"      # one value per mouse
+CELLTYPE_COL <- "celltype"
+CLUSTER_COL  <- "seurat_clusters" # set NULL to skip cluster checks
+SEX_COL      <- "sex"
+AGE_COL      <- "age"
+COND_COL     <- "experimental.condition"
+RUN_PATTERN  <- "SR[0-9]+"        # sequencing run parsed from the sample name (NULL to skip)
+DOUBLET_COL  <- NULL              # e.g. "scDblFinder.score" if your object has one
+
+# The filters you INTENDED to apply (from your QC script / Methods). NA = not used.
+EXPECTED <- list(min_features=NA, max_features=NA, min_counts=NA, max_counts=NA, max_mito=NA)
+
+MITO_PATTERN <- "^mt-"; RIBO_PATTERN <- "^Rp[sl][0-9]"
+Y_GENES <- c("Ddx3y","Eif2s3y","Kdm5d","Uty")
+LINEAGE_MARKERS <- list(                     # small, canonical sets for co-expression / ambient checks
+  Neuron      = c("Snap25","Syt1","Rbfox3","Stmn2"),
+  Astrocyte   = c("Aqp4","Gja1","Slc1a2","Aldh1l1"),
+  Oligo       = c("Mbp","Plp1","Mog","Mobp"),
+  OPC         = c("Pdgfra","Cspg4"),
+  Microglia   = c("Cx3cr1","P2ry12","Csf1r","Hexb"),
+  Vascular    = c("Cldn5","Flt1","Pecam1","Vtn"))
+CT_LINEAGE <- c("DG ExNs"="Neuron","CA3 ExNs"="Neuron","CA1 ExNs"="Neuron","CA2 ExNs"="Neuron","Sub ExNs"="Neuron",
+                "IN"="Neuron","Cajal-Retzius Cell"="Neuron","Astrocytes"="Astrocyte","Oligodendrocytes"="Oligo",
+                "OPC"="OPC","Microglia"="Microglia","Macrophage"="Microglia","Endothelial"="Vascular","Pericyte"="Vascular",
+                "APC"="Vascular","Stromal"="Vascular")
+COEXP_UMI  <- 3      # a second lineage counts in a cell with >= this many of its marker UMIs ...
+COEXP_FRAC <- 0.25   # ... and >= this fraction of the cell's own-lineage marker UMIs (ambient alone rarely reaches this)
+MAD_K      <- 3      # outlier = > MAD_K median absolute deviations from the group median
+ONE_MOUSE_MAX <- 0.5 # cluster flagged if one mouse contributes more than this fraction
+MIN_CELLS_CT  <- 50  # per mouse x cell type, below this the per-mouse value is not judged
+
+dir.create(OUT, recursive=TRUE, showWarnings=FALSE)
+summary_rows <- list(); tables <- list(); plots <- list()
+verdict <- function(check, status, detail) {
+  summary_rows[[length(summary_rows) + 1]] <<- data.frame(check=check, status=status, detail=detail)
+  cat(sprintf("[%-5s] %-28s %s\n", status, check, detail))
+}
+mad_out <- function(x) { m <- median(x, na.rm=TRUE); s <- mad(x, na.rm=TRUE); if (!is.finite(s) || s == 0) return(rep(FALSE, length(x)))
+  abs(x - m) > MAD_K * s }
+th <- theme_classic(base_size=8) + theme(strip.background=element_rect(fill="grey93", color=NA),
+  axis.text.x=element_text(angle=60, hjust=1, size=5), plot.title=element_text(face="bold"))
+
+################################################################################
+### LOAD
+################################################################################
+
+obj <- if (!is.null(SEURAT_RDS)) readRDS(SEURAT_RDS) else get(OBJ_NAME)
+DefaultAssay(obj) <- ASSAY
+md <- obj@meta.data %>% dplyr::select(-dplyr::any_of("cell_id")) %>% tibble::rownames_to_column("cell_id")
+need <- c(SAMPLE_COL, CELLTYPE_COL, SEX_COL, AGE_COL, COND_COL, "nCount_RNA", "nFeature_RNA")
+miss <- setdiff(need, names(md)); if (length(miss)) stop("Missing metadata columns: ", paste(miss, collapse=", "), " (set the *_COL parameters)")
+md <- md %>% dplyr::mutate(sample=.data[[SAMPLE_COL]], celltype=as.character(.data[[CELLTYPE_COL]]),
+                           sex=tolower(.data[[SEX_COL]]), age=tolower(.data[[AGE_COL]]), cond=.data[[COND_COL]],
+                           run=if (!is.null(RUN_PATTERN)) { r <- regmatches(sample, regexpr(RUN_PATTERN, sample)); out <- rep(NA_character_, length(sample)); out[regexpr(RUN_PATTERN, sample) > 0] <- r; out } else "all",
+                           group=paste(sex, age, cond, sep=" | "))
+md$run[is.na(md$run)] <- "unknown"
+genes <- rownames(obj)
+cnt <- function(g) {  # counts for a few genes, cells in md order (works with BPCells)
+  g <- intersect(g, genes); if (!length(g)) return(NULL)
+  m <- LayerData(obj, assay=ASSAY, layer="counts")[g, md$cell_id, drop=FALSE]
+  as(as(m, "dgCMatrix"), "CsparseMatrix") }
+colsum_genes <- function(g) { g <- intersect(g, genes); if (!length(g)) return(rep(0, nrow(md)))
+  out <- numeric(nrow(md)); for (ch in split(g, ceiling(seq_along(g) / 200))) out <- out + Matrix::colSums(cnt(ch)); out }
+
+if (!"percent.mt" %in% names(md) || all(is.na(md$percent.mt))) md$percent.mt <- 100 * colsum_genes(grep(MITO_PATTERN, genes, value=TRUE)) / md$nCount_RNA
+md$percent.ribo <- 100 * colsum_genes(grep(RIBO_PATTERN, genes, value=TRUE)) / md$nCount_RNA
+cat(sprintf("Cells: %d | mice: %d | cell types: %d | runs: %s\n\n", nrow(md), dplyr::n_distinct(md$sample),
+            dplyr::n_distinct(md$celltype), paste(unique(md$run), collapse=", ")))
+
+################################################################################
+### 1 THRESHOLDS
+################################################################################
+
+rng <- md %>% dplyr::summarise(min_features=min(nFeature_RNA), max_features=max(nFeature_RNA),
+                               min_counts=min(nCount_RNA), max_counts=max(nCount_RNA), max_mito=max(percent.mt, na.rm=TRUE))
+tables$T1_ObservedRanges <- rng
+viol <- c(min_features=sum(md$nFeature_RNA < EXPECTED$min_features), max_features=sum(md$nFeature_RNA > EXPECTED$max_features),
+          min_counts=sum(md$nCount_RNA < EXPECTED$min_counts), max_counts=sum(md$nCount_RNA > EXPECTED$max_counts),
+          max_mito=sum(md$percent.mt > EXPECTED$max_mito, na.rm=TRUE))
+viol <- viol[!is.na(unlist(EXPECTED[names(viol)]))]
+if (!length(viol)) verdict("1 Thresholds", "CHECK", sprintf("EXPECTED not set; observed: genes %d-%d, UMIs %d-%d, max %% mito %.2f",
+                              rng$min_features, rng$max_features, rng$min_counts, rng$max_counts, rng$max_mito)) else
+  verdict("1 Thresholds", if (sum(viol) == 0) "PASS" else "FLAG",
+          paste(sprintf("%s: %d cells outside", names(viol), viol), collapse="; "))
+plots$p1 <- ggplot(md, aes(nFeature_RNA, percent.mt)) + geom_bin2d(bins=80) + scale_x_log10() +
+  scale_fill_viridis_c(trans="log10") + th + labs(title="1 Genes vs % mito (all retained nuclei)")
+
+################################################################################
+### 2 PER SAMPLE
+################################################################################
+
+ps <- md %>% dplyr::group_by(sample, run, sex, age, cond, group) %>%
+  dplyr::summarise(n_nuclei=dplyr::n(), median_UMI=median(nCount_RNA), median_genes=median(nFeature_RNA),
+                   median_mito=median(percent.mt, na.rm=TRUE), median_ribo=median(percent.ribo), .groups="drop") %>%
+  dplyr::group_by(sex, run) %>%
+  dplyr::mutate(out_n=mad_out(log(n_nuclei)), out_UMI=mad_out(log(median_UMI)), out_genes=mad_out(log(median_genes)),
+                out_mito=mad_out(median_mito)) %>% dplyr::ungroup() %>%
+  dplyr::mutate(flags=paste0(ifelse(out_n, "nuclei ", ""), ifelse(out_UMI, "UMI ", ""), ifelse(out_genes, "genes ", ""),
+                             ifelse(out_mito, "mito", "")))
+tables$T2_PerSample <- ps
+fl <- ps %>% dplyr::filter(nzchar(trimws(flags)))
+verdict("2 Per-sample metrics", if (!nrow(fl)) "PASS" else "CHECK",
+        if (!nrow(fl)) "no mouse > 3 MAD from others of its sex and run" else
+          paste(sprintf("%s (%s): %s", fl$sample, fl$group, trimws(fl$flags)), collapse="; "))
+plots$p2 <- ps %>% tidyr::pivot_longer(c(n_nuclei, median_UMI, median_genes, median_mito)) %>%
+  ggplot(aes(sample, value, fill=run)) + geom_col() + facet_grid(name ~ sex, scales="free", space="free_x") + th +
+  labs(title="2 Per-mouse QC metrics (sexes separate)", x=NULL, y=NULL)
+
+################################################################################
+### 3 SEX CHECK
+################################################################################
+
+xist <- colsum_genes("Xist"); ychr <- colsum_genes(Y_GENES)
+sx <- md %>% dplyr::mutate(xist=xist, ychr=ychr) %>% dplyr::group_by(sample, sex) %>%
+  dplyr::summarise(Xist_per10k=1e4 * sum(xist) / sum(nCount_RNA), Y_per10k=1e4 * sum(ychr) / sum(nCount_RNA), .groups="drop") %>%
+  dplyr::mutate(inferred=ifelse(Xist_per10k > Y_per10k, "female", "male"), match=inferred == sex)
+tables$T3_SexCheck <- sx
+verdict("3 Sex check", if (all(sx$match)) "PASS" else "FLAG",
+        if (all(sx$match)) sprintf("all %d mice: Xist / chrY agree with metadata sex", nrow(sx)) else
+          paste("mismatch:", paste(sx$sample[!sx$match], collapse=", ")))
+plots$p3 <- ggplot(sx, aes(Xist_per10k, Y_per10k, color=sex, shape=match)) + geom_point(size=2) +
+  geom_text(data=sx %>% dplyr::filter(!match), aes(label=sample), size=2, vjust=-0.8) + th +
+  labs(title="3 Sex check: Xist vs chrY genes per mouse", x="Xist UMIs per 10k", y="chrY UMIs per 10k")
+
+################################################################################
+### 4 MITO / RIBO PER CELL TYPE
+################################################################################
+
+mr <- md %>% dplyr::group_by(celltype) %>%
+  dplyr::summarise(n=dplyr::n(), median_mito=median(percent.mt, na.rm=TRUE), p95_mito=quantile(percent.mt, 0.95, na.rm=TRUE),
+                   median_ribo=median(percent.ribo), median_genes=median(nFeature_RNA), .groups="drop") %>% dplyr::arrange(dplyr::desc(median_mito))
+tables$T4_MitoRibo_PerCellType <- mr
+hi <- mr %>% dplyr::filter(median_mito > 2)
+verdict("4 Mito / ribo", if (!nrow(hi)) "PASS" else "CHECK",
+        if (!nrow(hi)) sprintf("median %% mito <= 2 in every cell type (max %.2f)", max(mr$median_mito)) else
+          paste(sprintf("%s median %.1f%%", hi$celltype, hi$median_mito), collapse="; "))
+plots$p4 <- ggplot(md, aes(celltype, percent.mt + 0.01)) + geom_violin(scale="width", fill="grey85", linewidth=0.2) +
+  scale_y_log10() + th + labs(title="4 % mito per cell type (nuclei: expected low)", x=NULL, y="% mito (log)")
+
+################################################################################
+### 5 DOUBLETS (lineage co-expression)
+################################################################################
+
+lin <- sapply(LINEAGE_MARKERS, colsum_genes)
+expr <- lin >= COEXP_UMI
+own <- CT_LINEAGE[md$celltype]
+own_umi <- lin[cbind(seq_len(nrow(md)), match(own, colnames(lin)))]
+other_hit <- sapply(seq_len(nrow(md)), function(i) { if (is.na(own[i])) return(NA)
+  o <- setdiff(colnames(expr), own[i]); if (own[i] %in% c("Oligo","OPC")) o <- setdiff(o, c("Oligo","OPC"))
+  any(expr[i, o] & lin[i, o] >= COEXP_FRAC * own_umi[i]) })
+md$coexp <- other_hit & expr[cbind(seq_len(nrow(md)), match(own, colnames(expr)))]
+db <- md %>% dplyr::filter(!is.na(coexp)) %>% dplyr::group_by(celltype) %>%
+  dplyr::summarise(n=dplyr::n(), pct_coexpressing=round(100 * mean(coexp), 2),
+                   median_UMI_coexp=median(nCount_RNA[coexp]), median_UMI_rest=median(nCount_RNA[!coexp]), .groups="drop") %>%
+  dplyr::arrange(dplyr::desc(pct_coexpressing))
+if (!is.null(DOUBLET_COL) && DOUBLET_COL %in% names(md))
+  db <- db %>% dplyr::left_join(md %>% dplyr::group_by(celltype) %>% dplyr::summarise(mean_doublet_score=mean(.data[[DOUBLET_COL]], na.rm=TRUE)), by="celltype")
+tables$T5_Doublets_CoExpression <- db
+hi <- db %>% dplyr::filter(pct_coexpressing > 5)
+verdict("5 Doublets", if (!nrow(hi)) "PASS" else "CHECK",
+        if (!nrow(hi)) sprintf("<= 5%% of nuclei co-express another lineage in every cell type (max %.1f%%)", max(db$pct_coexpressing)) else
+          paste(sprintf("%s %.1f%% (UMI %.0f vs %.0f)", hi$celltype, hi$pct_coexpressing, hi$median_UMI_coexp, hi$median_UMI_rest), collapse="; "))
+
+################################################################################
+### 6 AMBIENT RNA (other-lineage marker UMIs per 1,000 UMIs, per mouse x cell type)
+################################################################################
+
+amb <- dplyr::bind_rows(lapply(colnames(lin), function(L) md %>% dplyr::mutate(m=lin[, L]) %>%
+  dplyr::filter(!is.na(CT_LINEAGE[celltype]), CT_LINEAGE[celltype] != L, !(L %in% c("Oligo","OPC") & CT_LINEAGE[celltype] %in% c("Oligo","OPC"))) %>%
+  dplyr::group_by(sample, sex, age, cond, run, celltype) %>%
+  dplyr::summarise(n=dplyr::n(), per1k=1e3 * sum(m) / sum(nCount_RNA), .groups="drop") %>% dplyr::mutate(lineage=L)))
+amb_n <- amb %>% dplyr::filter(lineage == "Neuron", n >= MIN_CELLS_CT) %>% dplyr::group_by(celltype, sex) %>%
+  dplyr::mutate(outlier=mad_out(per1k)) %>% dplyr::ungroup()
+tables$T6_Ambient_PerMouse <- amb
+fl <- amb_n %>% dplyr::filter(outlier)
+verdict("6 Ambient RNA", if (!nrow(fl)) "PASS" else "CHECK",
+        if (!nrow(fl)) "no mouse is an outlier for neuronal-marker UMIs in non-neuronal cells" else
+          paste(sprintf("%s %s (%s): %.2f per 1k", fl$sample, fl$celltype, fl$run, fl$per1k), collapse="; "))
+if (nrow(amb_n)) plots$p6 <- ggplot(amb %>% dplyr::filter(lineage == "Neuron", n >= MIN_CELLS_CT), aes(sample, per1k, fill=run)) + geom_col() +
+  facet_grid(celltype ~ sex, scales="free", space="free_x") + th + theme(strip.text.y=element_text(angle=0, size=5)) +
+  labs(title="6 Neuronal-marker UMIs per 1,000 UMIs in non-neuronal cells, per mouse", x=NULL, y=NULL)
+
+################################################################################
+### 7 CLUSTERS
+################################################################################
+
+if (!is.null(CLUSTER_COL) && CLUSTER_COL %in% names(md)) {
+  cl <- md %>% dplyr::group_by(cluster=.data[[CLUSTER_COL]]) %>%
+    dplyr::summarise(n=dplyr::n(), top_celltype=names(sort(table(celltype), decreasing=TRUE))[1],
+                     median_genes=median(nFeature_RNA), median_mito=median(percent.mt, na.rm=TRUE),
+                     top_mouse_frac=max(table(sample)) / dplyr::n(), top_mouse=names(which.max(table(sample))), .groups="drop") %>%
+    dplyr::mutate(low_quality=mad_out(log(median_genes)) & median_genes < median(median_genes),
+                  one_mouse=top_mouse_frac > ONE_MOUSE_MAX)
+  tables$T7_Clusters <- cl
+  fl <- cl %>% dplyr::filter(low_quality | one_mouse)
+  verdict("7 Clusters", if (!nrow(fl)) "PASS" else "CHECK",
+          if (!nrow(fl)) "no low-quality or single-mouse clusters" else
+            paste(sprintf("cluster %s (%s): %s", fl$cluster, fl$top_celltype,
+                          ifelse(fl$one_mouse, sprintf("%.0f%% from %s", 100 * fl$top_mouse_frac, fl$top_mouse), "low genes")), collapse="; "))
+} else verdict("7 Clusters", "CHECK", "CLUSTER_COL not found; skipped")
+
+################################################################################
+### 8 COMPOSITION
+################################################################################
+
+comp <- md %>% dplyr::count(sample, sex, age, cond, group, run, celltype) %>% dplyr::group_by(sample) %>%
+  dplyr::mutate(frac=n / sum(n)) %>% dplyr::ungroup() %>% dplyr::group_by(group, celltype) %>%
+  dplyr::mutate(group_median=median(frac), outlier=dplyr::n() >= 3 & abs(frac - group_median) > pmax(0.05, 2 * mad(frac))) %>% dplyr::ungroup()
+tables$T8_Composition <- comp
+fl <- comp %>% dplyr::filter(outlier)
+verdict("8 Composition", if (!nrow(fl)) "PASS" else "CHECK",
+        if (!nrow(fl)) "no mouse's cell-type proportions differ by > 5 points from its group" else
+          paste(sprintf("%s %s %.0f%% (group median %.0f%%)", fl$sample, fl$celltype, 100 * fl$frac, 100 * fl$group_median), collapse="; "))
+plots$p8 <- ggplot(comp, aes(sample, frac, fill=celltype)) + geom_col() + facet_grid(. ~ sex + age + cond, scales="free_x", space="free_x") +
+  th + theme(strip.text=element_text(size=5), legend.key.size=unit(2.5, "mm")) + labs(title="8 Cell-type composition per mouse", x=NULL, y="Fraction")
+
+################################################################################
+### 9 RUNS (within sex x age x condition)
+################################################################################
+
+rr <- ps %>% dplyr::group_by(group) %>% dplyr::filter(dplyr::n_distinct(run) > 1) %>% dplyr::group_by(group, run) %>%
+  dplyr::summarise(mice=dplyr::n(), median_UMI=median(median_UMI), median_genes=median(median_genes), median_mito=median(median_mito), .groups="drop")
+tables$T9_Runs_WithinGroup <- rr
+verdict("9 Runs within group", if (!nrow(rr)) "PASS" else "CHECK",
+        if (!nrow(rr)) "every sex x age x condition group comes from a single run" else
+          paste(unique(sprintf("%s: runs %s", rr$group, ave(rr$run, rr$group, FUN=function(x) paste(x, collapse=" vs ")))), collapse="; "))
+
+################################################################################
+### WRITE
+################################################################################
+
+S <- dplyr::bind_rows(summary_rows); write.csv(S, file.path(OUT, "QC_Audit_Summary.csv"), row.names=FALSE)
+for (nm in names(tables)) write.csv(tables[[nm]], file.path(OUT, paste0("QC_Audit_", nm, ".csv")), row.names=FALSE)
+if (requireNamespace("openxlsx", quietly=TRUE)) openxlsx::write.xlsx(c(list(Summary=S), tables), file.path(OUT, "QC_Audit.xlsx"))
+pdf(file.path(OUT, "QC_Audit_Plots.pdf"), width=11, height=8.5); for (p in plots) print(p); invisible(dev.off())
+cat("\nPASS =", sum(S$status == "PASS"), "| CHECK =", sum(S$status == "CHECK"), "| FLAG =", sum(S$status == "FLAG"),
+    "\nOutputs in:", OUT, "\n")
+```
